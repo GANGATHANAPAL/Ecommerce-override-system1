@@ -1,0 +1,6 @@
+Policy,Simulated Reward
+No intervention,0.0338
+Personalized recommendation,0.0923
+Loyalty incentive,0.0831
+Proactive retention offer,0.0769
+LinUCB,0.0862

@@ -1,0 +1,2 @@
+model,accuracy,roc_auc,pr_auc,retained_precision,retained_recall,retained_f1,churn_precision,churn_recall,churn_f1
+Random Forest,0.978,0.5626192095960335,0.9900921736267524,0.0171,0.0153,0.0161,0.9883,0.9895,0.9889

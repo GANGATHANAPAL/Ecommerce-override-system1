@@ -1,0 +1,7 @@
+Model,ROC-AUC
+Original All-Customer Random Forest,0.5262
+Repeat-Customer Random Forest,0.7072
+GRU Sequential Behaviour Encoder,0.7738
+Hybrid RF + XGBoost + GRU,0.7501
+Equal-Weight CRPI,0.6199
+Frozen Weighted CRPI,0.7
