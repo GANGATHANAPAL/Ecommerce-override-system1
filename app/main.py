@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from app.inference.pipeline import analyze_customer, find_demo_customer, load_demo_customers
 
 HOST = "0.0.0.0"
-PORT = 8000
+PORT = int(os.environ.get("PORT", "8000"))
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
