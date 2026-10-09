@@ -2,32 +2,23 @@ from __future__ import annotations
 
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+import pandas as pd
+import torch
 
-from app.inference.drift import PageHinkley, classify_drift_score, embed_drift_score, page_hinkley_flag
-from app.inference.linucb import ACTION_LABELS, choose_linucb_action
-from app.inference.model_loader import artifact_status_message, get_missing_artifacts
-from app.inference.recommendation_override import evaluate_override
+from app.inference.drift import PageHinkley, classify_drift_score
+from app.inference.model_loader import (
+    artifact_status_message,
+    get_missing_artifacts,
+    load_trained_artifacts,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEMO_CUSTOMERS_PATH = PROJECT_ROOT / "app" / "data" / "demo_customers.json"
-
-STATIC_FEATURE_COLUMNS = [
-    "total_orders",
-    "total_items",
-    "total_spending",
-    "avg_order_value",
-    "avg_review_score",
-    "total_products",
-    "total_sellers",
-    "avg_installments",
-    "recency_days",
-    "customer_lifetime_days",
-]
-
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -83,42 +74,48 @@ def build_static_features(customer: Dict[str, Any]) -> Dict[str, float]:
 
 def build_purchase_sequence(customer: Dict[str, Any]) -> np.ndarray:
     total_orders = max(1, int(round(_safe_float(customer.get("previous_orders"), 1.0))))
-    total_spending = _safe_float(customer.get("total_spending"), 0.0)
-    avg_order_value = _safe_float(customer.get("avg_order_value"), 0.0)
-    recency_days = _safe_float(customer.get("recency_days"), 30.0)
+    delivered_orders = max(1.0, _safe_float(customer.get("delivered_orders"), 1.0))
     avg_gap_days = _safe_float(customer.get("avg_days_between_purchases"), 30.0)
     avg_review_score = _safe_float(customer.get("avg_review_score"), 4.2)
-    cancelled_orders = _safe_float(customer.get("cancelled_orders"), 0.0)
-    delivered_orders = _safe_float(customer.get("delivered_orders"), 1.0)
     payment_attempts = _safe_float(customer.get("payment_attempts"), 1.0)
     sequence_len = min(12, max(6, total_orders))
     history_values = customer.get("order_amount_history") or []
     gap_history = customer.get("gap_history_days") or []
+    average_items = max(
+        1.0,
+        (_safe_float(customer.get("delivered_orders"), 0.0)
+         + 0.35 * _safe_float(customer.get("cancelled_orders"), 0.0))
+        / total_orders,
+    )
+    average_products = max(
+        1.0,
+        _safe_float(customer.get("product_count"), 1.0) / total_orders,
+    )
+    average_sellers = max(
+        1.0,
+        _safe_float(customer.get("seller_count"), 1.0) / total_orders,
+    )
+    average_installments = max(0.0, payment_attempts / delivered_orders)
 
     sequence: List[List[float]] = []
     for idx in range(sequence_len):
         if idx < len(history_values):
-            amount = history_values[idx]
+            amount = _safe_float(history_values[idx])
         else:
-            amount = avg_order_value * (0.85 + (idx / max(sequence_len, 1)) * 0.4)
+            amount = _safe_float(customer.get("avg_order_value"), 0.0)
         if idx < len(gap_history):
-            gap_days = gap_history[idx]
+            gap_days = _safe_float(gap_history[idx])
         else:
             gap_days = max(5.0, avg_gap_days * (0.7 + ((idx + 1) / max(sequence_len, 1))))
-        item_count = max(1.0, amount / max(avg_order_value, 1.0))
-        payment_pressure = payment_attempts / max(delivered_orders + cancelled_orders, 1.0)
-        cancelled_flag = 1.0 if idx < cancelled_orders else 0.0
-        review_signal = avg_review_score - 2.5
-        spend_trend = (idx + 1) / max(sequence_len, 1)
         event = [
-            float(amount) / 250.0,
-            float(item_count) / 12.0,
-            float(gap_days) / 90.0,
-            float(review_signal) / 5.0,
-            float(spend_trend),
-            float(payment_pressure),
-            float(cancelled_flag),
-            float((total_spending / max(total_orders, 1)) / 250.0),
+            average_items,
+            amount,
+            average_products,
+            average_sellers,
+            amount * 1.1,
+            average_installments,
+            avg_review_score,
+            gap_days,
         ]
         sequence.append(event)
     return np.asarray(sequence, dtype=np.float64)
@@ -187,72 +184,229 @@ def classify_prediction(probability: float) -> str:
     return "HIGH CHURN RISK" if probability >= 0.5 else "LOW CHURN RISK"
 
 
+@lru_cache(maxsize=1)
+def _load_trained_pipeline() -> Dict[str, Any]:
+    return load_trained_artifacts()
+
+
+@lru_cache(maxsize=1)
+def _load_observation_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    features_path = PROJECT_ROOT / "data" / "processed" / "customer_features_observation.csv"
+    orders_path = PROJECT_ROOT / "data" / "processed" / "observation_orders.csv"
+    features = pd.read_csv(features_path, dtype={"customer_unique_id": "string"})
+    orders = pd.read_csv(orders_path, dtype={"customer_unique_id": "string"})
+    return features, orders
+
+
 def analyze_customer(payload: Dict[str, Any]) -> Dict[str, Any]:
-    customer = {k: payload.get(k, 0) for k in [
-        "customer_id",
-        "display_name",
-        "risk_profile",
-        "tenure_months",
-        "previous_orders",
-        "avg_order_value",
-        "total_spending",
-        "recency_days",
-        "avg_days_between_purchases",
-        "last_order_amount",
-        "avg_review_score",
-        "cancelled_orders",
-        "delivered_orders",
-        "payment_attempts",
-        "preferred_payment_type",
-        "product_count",
-        "seller_count",
-        "category",
-        "recent_purchase_behavior",
-        "previous_purchase_behavior",
-    ]}
-    customer["customer_id"] = customer.get("customer_id") or "MANUAL_CUSTOMER"
-    customer["display_name"] = customer.get("display_name") or customer["customer_id"]
-    customer["risk_profile"] = (customer.get("risk_profile") or "Medium").title()
-    static_features = build_static_features(customer)
-    rf_probability = _rf_probability(static_features, customer["risk_profile"])
-    xgb_probability = _xgb_probability(static_features, customer["risk_profile"])
-    sequence = build_purchase_sequence(customer)
-    gru_embedding = generate_gru_embedding(sequence, rf_probability)
-    fusion = np.concatenate(([rf_probability, xgb_probability], gru_embedding))
-    final_probability = meta_learner_probability(fusion)
-    drift_trace = [float(np.linalg.norm(sequence[i] - sequence[max(0, i - 1)])) for i in range(1, len(sequence))]
-    base_drift = embed_drift_score(sequence)
-    drift_score = float(max(base_drift, float(np.mean(drift_trace)) if drift_trace else 0.0))
-    page_hinkley = page_hinkley_flag([drift_score, drift_score * 0.8, drift_score * 1.2, drift_score])
+    customer_id = str(
+        payload.get("customer_unique_id") or payload.get("customer_id") or ""
+    ).strip()
+    if not customer_id:
+        raise ValueError("A customer ID is required for trained-model inference.")
+
+    artifacts = _load_trained_pipeline()
+    feature_list = artifacts["feature_list"]
+    static_columns = feature_list["static_features"]
+    sequence_columns = feature_list["sequence_features"]
+    is_demo_profile = customer_id.upper().startswith("DEMO_")
+    if is_demo_profile:
+        demo_customer = {**find_demo_customer(customer_id), **payload}
+        static_features = build_static_features(demo_customer)
+        matching_features = pd.DataFrame(
+            [[static_features[column] for column in static_columns]],
+            columns=static_columns,
+        )
+        raw_sequence = pd.DataFrame(
+            build_purchase_sequence(demo_customer),
+            columns=sequence_columns,
+        )
+    else:
+        features, orders = _load_observation_data()
+        matching_features = features.loc[
+            features["customer_unique_id"] == customer_id,
+            static_columns,
+        ]
+        if len(matching_features) != 1:
+            raise KeyError(f"Customer not found in the observation-period feature data: {customer_id}")
+
+        raw_events = orders.loc[
+            orders["customer_unique_id"] == customer_id,
+            [
+                "order_purchase_timestamp",
+                *[
+                    column
+                    for column in sequence_columns
+                    if column != "time_since_previous_order_days"
+                ],
+            ],
+        ].copy()
+        if raw_events.empty:
+            raise KeyError(f"No observation-period order sequence found for customer: {customer_id}")
+        raw_events["order_purchase_timestamp"] = pd.to_datetime(
+            raw_events["order_purchase_timestamp"],
+            errors="raise",
+        )
+        raw_events = raw_events.sort_values("order_purchase_timestamp")
+        if len(raw_events) < 2:
+            raise ValueError("The trained pipeline requires at least two observed orders.")
+
+        gap_days = (
+            raw_events["order_purchase_timestamp"].diff().dt.total_seconds()
+            / (60 * 60 * 24)
+        )
+        raw_events["time_since_previous_order_days"] = gap_days.fillna(0.0)
+        raw_sequence = raw_events[sequence_columns]
+
+    raw_sequence = raw_sequence.astype(np.float32)
+    imputed_sequence = artifacts["sequence_imputer"].transform(raw_sequence)
+    sequence = artifacts["sequence_scaler"].transform(
+        pd.DataFrame(imputed_sequence, columns=sequence_columns)
+    ).astype(np.float32, copy=False)
+    static_matrix = artifacts["static_imputer"].transform(matching_features)
+    static_frame = pd.DataFrame(static_matrix, columns=static_columns)
+
+    rf_model = artifacts["rf_model"]
+    xgb_model = artifacts["xgb_model"]
+    meta_model = artifacts["meta_model"]
+    rf_probability = float(
+        rf_model.predict_proba(static_frame)[0, list(rf_model.classes_).index(1)]
+    )
+    xgb_probability = float(
+        xgb_model.predict_proba(static_frame)[0, list(xgb_model.classes_).index(1)]
+    )
+
+    gru_model = artifacts["gru_model"]
+    sequence_tensor = torch.as_tensor(sequence, dtype=torch.float32).unsqueeze(0)
+    sequence_lengths = torch.tensor([len(sequence)], dtype=torch.long)
+    with torch.no_grad():
+        hidden_states, final_embedding, _ = gru_model(sequence_tensor, sequence_lengths)
+    gru_embedding = final_embedding[0].cpu().numpy()
+    fusion = np.concatenate(
+        (
+            np.asarray([rf_probability, xgb_probability], dtype=np.float64),
+            gru_embedding.astype(np.float64, copy=False),
+        )
+    ).reshape(1, -1)
+    final_probability = float(
+        meta_model.predict_proba(fusion)[0, list(meta_model.classes_).index(1)]
+    )
+
+    valid_states = hidden_states[0, : len(sequence)].cpu().numpy()
+    split_point = max(1, len(valid_states) // 2)
+    early_states = valid_states[:split_point]
+    recent_states = valid_states[split_point:]
+    if len(recent_states) == 0:
+        recent_states = valid_states[-1:]
+    drift_score = float(
+        np.linalg.norm(recent_states.mean(axis=0) - early_states.mean(axis=0))
+    )
+
+    drift_config = artifacts["drift_config"]
+    drift_threshold = drift_config["drift_threshold"]
+    drift_flag = int(drift_score >= drift_threshold)
+    page_hinkley_config = drift_config["page_hinkley"]
+    page_hinkley_detector = PageHinkley(
+        delta=page_hinkley_config["delta"],
+        threshold=page_hinkley_config["threshold"],
+        alpha=page_hinkley_config["alpha"],
+    )
+    page_hinkley_detector.mean = page_hinkley_config["mean"]
+    page_hinkley_detector.sum = page_hinkley_config["sum"]
+    page_hinkley_detector.min_sum = page_hinkley_config["min_sum"]
+    page_hinkley_detector.count = page_hinkley_config["count"]
+    page_hinkley = page_hinkley_detector.update(drift_score)
+
+    static_values = static_frame.iloc[0].to_dict()
+    total_orders = float(static_values["total_orders"])
+    total_spending = float(static_values["total_spending"])
+    customer_lifetime_days = float(static_values["customer_lifetime_days"])
+    avg_order_value_clv = total_spending / total_orders
+    order_frequency = total_orders / max(customer_lifetime_days, 1.0)
+    clv_proxy = float(avg_order_value_clv * order_frequency)
+
+    crpi_scalers = artifacts["crpi_scalers"]
+    churn_scaler = crpi_scalers["churn_scaler"]
+    clv_scaler = crpi_scalers["clv_scaler"]
+    drift_scaler = crpi_scalers["drift_scaler"]
+    churn_normalized = float(
+        churn_scaler.transform(np.asarray([[final_probability]]))[0, 0]
+    )
+    clv_normalized = float(
+        clv_scaler.transform(
+            pd.DataFrame([[np.log1p(clv_proxy)]], columns=["clv_log"])
+        )[0, 0]
+    )
+    drift_normalized = float(
+        drift_scaler.transform(
+            pd.DataFrame([[drift_score]], columns=["drift_severity"])
+        )[0, 0]
+    )
+    crpi_score = float((churn_normalized + clv_normalized + drift_normalized) / 3.0)
+    if crpi_score >= crpi_scalers["crpi_high_threshold"]:
+        retention_priority = "High"
+    elif crpi_score >= crpi_scalers["crpi_medium_threshold"]:
+        retention_priority = "Medium"
+    else:
+        retention_priority = "Low"
+
+    context_features = feature_list["bandit_context_features"]
+    context = pd.DataFrame(
+        [[final_probability, crpi_score, drift_score, clv_normalized]],
+        columns=context_features,
+    )
+    policy = artifacts["linucb_policy"]
+    normalized_context = policy["context_scaler"].transform(context)[0]
+    action_scores = []
+    for action in range(policy["n_actions"]):
+        inverse = np.linalg.inv(policy["A"][action])
+        theta = inverse @ policy["b"][action]
+        exploitation = theta @ normalized_context
+        exploration = policy["alpha"] * np.sqrt(
+            normalized_context @ inverse @ normalized_context
+        )
+        action_scores.append(exploitation + exploration)
+    action_index = int(np.argmax(action_scores))
+    linucb_action = feature_list["retention_actions"][action_index].title()
+    override_triggered = False
+    final_action = linucb_action
+    static_features = {
+        key: float(value)
+        for key, value in static_values.items()
+    }
+    priority_label = f"{retention_priority} Priority"
     drift_label = classify_drift_score(drift_score)
-    clv_proxy = max(1.0, static_features["total_spending"] * 0.85)
-    crpi_score = compute_crpi(final_probability, clv_proxy, drift_score)
-    retention_priority = classify_priority(crpi_score)
-    linucb_action, _ = choose_linucb_action(final_probability, crpi_score, drift_score, clv_proxy / max(5000.0, clv_proxy), customer["risk_profile"])
-    override_triggered, final_action = evaluate_override(final_probability, drift_score, linucb_action)
     result = {
-        "customer_id": customer["customer_id"],
-        "display_name": customer["display_name"],
+        "customer_id": customer_id,
+        "display_name": payload.get("display_name") or customer_id,
         "static_features": static_features,
-        "rf_probability": float(np.clip(rf_probability, 0.0, 1.0)),
-        "xgb_probability": float(np.clip(xgb_probability, 0.0, 1.0)),
+        "rf_probability": rf_probability,
+        "xgb_probability": xgb_probability,
         "gru_embedding": gru_embedding.tolist(),
         "gru_embedding_dim": 64,
         "fusion_features_count": 66,
-        "final_churn_probability": float(np.clip(final_probability, 0.0, 1.0)),
+        "final_churn_probability": final_probability,
         "prediction_label": classify_prediction(final_probability),
         "behaviour_drift_score": float(drift_score),
+        "high_drift": drift_flag,
         "drift_classification": drift_label,
         "page_hinkley_change_detected": "YES" if page_hinkley else "NO",
         "crpi_score": float(crpi_score),
-        "retention_priority": retention_priority,
+        "clv_proxy": clv_proxy,
+        "clv_normalized": clv_normalized,
+        "retention_priority": priority_label,
         "base_linucb_action": linucb_action,
         "override_triggered": override_triggered,
         "final_retention_action": final_action,
-        "customer_value": float(total := static_features["total_spending"]),
+        "override_status": "No trained override rule is defined; LinUCB action retained.",
+        "customer_value": total_spending,
         "artifact_status": artifact_status_message(),
-        "missing_artifacts": get_missing_artifacts(),
-        "mode": "Demo fallback" if get_missing_artifacts() else "Trained artifact mode",
+        "missing_artifacts": [],
+        "mode": (
+            "Trained artifact mode (synthetic demo profile)"
+            if is_demo_profile
+            else "Trained artifact mode"
+        ),
     }
 
     for key, value in result.items():
@@ -260,6 +414,22 @@ def analyze_customer(payload: Dict[str, Any]) -> Dict[str, Any]:
             if math.isnan(value) or math.isinf(value):
                 raise ValueError(f"Non-finite value generated in result field: {key}")
     return result
+
+
+def infer_trained_customer(customer_id: str) -> Dict[str, Any]:
+    customer_features, observation_orders = _load_observation_data()
+    manifest_path = PROJECT_ROOT / "data" / "processed" / "customer_split_manifest.csv"
+    split_manifest = pd.read_csv(manifest_path, dtype={"customer_unique_id": "string"})
+    test_ids = set(
+        split_manifest.loc[split_manifest["split"] == "test", "customer_unique_id"].astype(str)
+    )
+    if customer_id not in test_ids:
+        raise KeyError(f"Customer is not present in the held-out test observation data: {customer_id}")
+    if not (customer_features["customer_unique_id"].astype(str) == str(customer_id)).any():
+        raise KeyError(f"Customer is not present in the observation-period feature data: {customer_id}")
+    if not (observation_orders["customer_unique_id"].astype(str) == str(customer_id)).any():
+        raise KeyError(f"No observation-period orders found for customer: {customer_id}")
+    return analyze_customer({"customer_unique_id": str(customer_id)})
 
 
 def find_demo_customer(customer_id: str) -> Dict[str, Any]:
