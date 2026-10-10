@@ -198,6 +198,133 @@ def _load_observation_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return features, orders
 
 
+def get_dataset_overview() -> Dict[str, Any]:
+    features, orders = _load_observation_data()
+    return {
+        "customer_count": int(features["customer_unique_id"].nunique()),
+        "observation_order_count": int(len(orders)),
+        "average_spend": float(features["total_spending"].mean()),
+        "average_order_value": float(features["avg_order_value"].mean()),
+        "average_review_score": float(features["avg_review_score"].mean()),
+    }
+
+
+def get_observation_customer(customer_id: str) -> Dict[str, Any]:
+    features, orders = _load_observation_data()
+    matches = features.loc[
+        features["customer_unique_id"] == customer_id,
+        [
+            "customer_unique_id",
+            "total_orders",
+            "total_items",
+            "total_spending",
+            "avg_order_value",
+            "avg_review_score",
+            "recency_days",
+            "customer_lifetime_days",
+        ],
+    ]
+    if matches.empty:
+        raise KeyError(f"Customer not found in observation-period feature data: {customer_id}")
+    record = matches.iloc[0].to_dict()
+    observed_order_count = int(
+        orders["customer_unique_id"].eq(customer_id).sum()
+    )
+    record["observed_order_count"] = observed_order_count
+    record["inference_available"] = observed_order_count >= 2
+    return {
+        key: (
+            None
+            if pd.isna(value)
+            else value.item()
+            if isinstance(value, np.generic)
+            else value
+        )
+        for key, value in record.items()
+    }
+
+
+def search_observation_customers(
+    query: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    sort_by: str = "total_spending",
+    sort_direction: str = "desc",
+) -> Dict[str, Any]:
+    features, orders = _load_observation_data()
+    sortable_columns = {
+        "customer_unique_id",
+        "total_orders",
+        "total_spending",
+        "avg_order_value",
+        "avg_review_score",
+        "recency_days",
+        "customer_lifetime_days",
+    }
+    if sort_by not in sortable_columns:
+        raise ValueError(f"Unsupported customer sort field: {sort_by}")
+    if sort_direction not in {"asc", "desc"}:
+        raise ValueError("sort_direction must be 'asc' or 'desc'.")
+    if page < 1 or not 1 <= page_size <= 100:
+        raise ValueError("page must be positive and page_size must be between 1 and 100.")
+
+    rows = features
+    normalized_query = query.strip()
+    if normalized_query:
+        rows = rows.loc[
+            rows["customer_unique_id"].str.contains(
+                normalized_query,
+                case=False,
+                regex=False,
+                na=False,
+            )
+        ]
+    rows = rows.sort_values(
+        sort_by,
+        ascending=sort_direction == "asc",
+        kind="stable",
+    )
+    total = int(len(rows))
+    start = (page - 1) * page_size
+    columns = [
+        "customer_unique_id",
+        "total_orders",
+        "total_items",
+        "total_spending",
+        "avg_order_value",
+        "avg_review_score",
+        "recency_days",
+        "customer_lifetime_days",
+    ]
+    observed_counts = orders["customer_unique_id"].value_counts()
+    items = []
+    for record in rows.iloc[start : start + page_size][columns].to_dict(orient="records"):
+        observed_order_count = int(
+            observed_counts.get(record["customer_unique_id"], 0)
+        )
+        record["observed_order_count"] = observed_order_count
+        record["inference_available"] = observed_order_count >= 2
+        items.append(
+            {
+                key: (
+                    None
+                    if pd.isna(value)
+                    else value.item()
+                    if isinstance(value, np.generic)
+                    else value
+                )
+                for key, value in record.items()
+            }
+        )
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+    }
+
+
 def analyze_customer(payload: Dict[str, Any]) -> Dict[str, Any]:
     customer_id = str(
         payload.get("customer_unique_id") or payload.get("customer_id") or ""
